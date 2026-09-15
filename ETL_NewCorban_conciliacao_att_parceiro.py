@@ -70,9 +70,12 @@ MOTIVOS_SUBSTATUS_PROTEGIDOS = {
     "Dados Divergentes na Receita Federal",
     "Sem contato",
 }
+
+
 FASES_REPROVACAO_BLOQUEIO = (
     "Reprovada - Cancelada",
     "Cancelado",)
+
 
 STATUS_REQUIRED_DATE_FIELD = {
     9113: "balance_return_date",
@@ -82,20 +85,28 @@ STATUS_REQUIRED_DATE_FIELD = {
     9117: "cancellation_date",
 }
 
+
 DEFAULT_OUTPUT_DIR = os.getenv(
     "NEWCORBAN_CONCILIACAO_PARCEIRO_OUTPUT_DIR",
     os.getenv("NEWCORBAN_CONCILIACAO_OUTPUT_DIR", "/home/qualiconsig"),
 )
+
 OUTPUT_FILE_NAME = os.getenv(
     "NEWCORBAN_CONCILIACAO_PARCEIRO_OUTPUT_FILE",
-    "conciliacao_newcorban_att_parceiro.xlsx",
-)
+    "conciliacao_newcorban_att_parceiro.xlsx",)
+
+
+
 FINANCIAL_PASSWORD = os.getenv("NEWCORBAN_FINANCIAL_PASSWORD")
 NEWCORBAN_TOKEN = 'nc_live_PsS9B39OC4kk2UoPShOCiksMOM8C5QwNbsUJFleH'
 API_TIMEOUT_SECONDS = int(os.getenv("NEWCORBAN_STATUS_API_TIMEOUT_SECONDS", "60"))
-API_MIN_DELAY_SECONDS = 2.0
+
+API_MIN_DELAY_SECONDS = 1.9
 API_RATE_LIMIT_MIN_REMAINING = 10
-API_RATE_LIMIT_MAX_SLEEP_SECONDS = 15.0
+API_RATE_LIMIT_MAX_SLEEP_SECONDS = 2.1
+
+
+
 
 TIPO_MAP = {
     1: "Novos",
@@ -105,8 +116,10 @@ TIPO_MAP = {
     5: "Refin da Port",
     6: "Novos",
     13: "Seguro",
-    9: "Cartao",
-}
+    9: "Cartao"}
+
+
+
 
 PRODUTO_MAP = {
     "NOVOS": "NOVO",
@@ -134,8 +147,9 @@ PRODUTO_MAP = {
     "Cartao": "CARTAO",
     "CARTAO": "CARTAO",
     "Cartão": "CARTAO",
-    "CARTÃO": "CARTAO",
-}
+    "CARTÃO": "CARTAO"}
+
+
 
 
 def normalize_text(value) -> str:
@@ -682,7 +696,7 @@ def load_dataframes(pg: PostgresHook):
             cpf,
             beneficio
         FROM {ATT_TABLE}
-        WHERE COALESCE(NULLIF(TRIM(af), ''), NULLIF(TRIM("numeroAde"), '')) IS NOT NULL and "dataContratoRefin" >= '2026-09-08'
+        WHERE COALESCE(NULLIF(TRIM(af), ''), NULLIF(TRIM("numeroAde"), '')) IS NOT NULL and "dataContratoRefin" >= '2026-09-07'
 """
 
 

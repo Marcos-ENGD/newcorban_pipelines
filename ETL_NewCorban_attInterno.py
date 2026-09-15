@@ -369,7 +369,7 @@ def correcao_api(params_init=None, run_uuid=None):
     params = {
         "status.code.ne": 30,
         "partner.code.eq": 41,
-        "LastUpdate.gte": '2026-08-30',
+        "LastUpdate.gte": '2026-09-15',
         "limit": api_limit,
     }
 

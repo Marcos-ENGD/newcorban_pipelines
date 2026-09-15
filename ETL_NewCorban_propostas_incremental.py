@@ -82,7 +82,8 @@ def ensure_assignment_columns(pg):
             ADD COLUMN IF NOT EXISTS supervisor_id BIGINT,
             ADD COLUMN IF NOT EXISTS supervisor TEXT,
             ADD COLUMN IF NOT EXISTS consultor_id BIGINT,
-            ADD COLUMN IF NOT EXISTS consultor TEXT
+            ADD COLUMN IF NOT EXISTS consultor TEXT,
+            ADD COLUMN IF NOT EXISTS balance_return_date TIMESTAMPTZ
     """
 
     pg.run(sql)
@@ -205,6 +206,7 @@ def montar_linha(item, table_names=None):
     assignment = item.get("assignment") or {}
     bank_reference = item.get("bank_reference") or {}
     dates = item.get("dates") or {}
+    benefit = item.get("benefit") or {}
 
     bank = proposal.get("bank") or {}
     product = proposal.get("product") or {}
@@ -227,6 +229,21 @@ def montar_linha(item, table_names=None):
         customer.get("id"),
         customer.get("name"),
         customer.get("cpf"),
+
+        benefit.get("id"),
+        benefit.get("covenant_id"),
+        benefit.get("covenant_name"),
+        benefit.get("registration_number"),
+        benefit.get("benefit_species"),
+        benefit.get("benefit_species_name"),
+        benefit.get("benefit_status"),
+        benefit.get("benefit_status_name"),
+        benefit.get("state"),
+        benefit.get("benefit_dispatch_date"),
+        benefit.get("unblock_date"),
+        benefit.get("margin"),
+        benefit.get("card_margin"),
+        benefit.get("calculation_base"),
 
         bank.get("id"),
         bank.get("name"),
@@ -277,6 +294,7 @@ def montar_linha(item, table_names=None):
         dates.get("endorsement_date"),
         dates.get("cancellation_date"),
         dates.get("completion_date"),
+        parse_api_datetime(dates.get("balance_return_date")),
 
         Json(item),
     )
@@ -295,6 +313,21 @@ def upsert_propostas_lote(pg, linhas):
             customer_id,
             customer_name,
             customer_cpf,
+
+            benefit_id,
+            benefit_covenant_id,
+            benefit_covenant_name,
+            benefit_registration_number,
+            benefit_species,
+            benefit_species_name,
+            benefit_status,
+            benefit_status_name,
+            benefit_state,
+            benefit_dispatch_date,
+            benefit_unblock_date,
+            benefit_margin,
+            benefit_card_margin,
+            benefit_calculation_base,
 
             bank_id,
             bank_name,
@@ -345,6 +378,7 @@ def upsert_propostas_lote(pg, linhas):
             endorsement_date,
             cancellation_date,
             completion_date,
+            balance_return_date,
 
             raw,
             synced_at
@@ -358,6 +392,21 @@ def upsert_propostas_lote(pg, linhas):
             customer_id = EXCLUDED.customer_id,
             customer_name = EXCLUDED.customer_name,
             customer_cpf = EXCLUDED.customer_cpf,
+
+            benefit_id = EXCLUDED.benefit_id,
+            benefit_covenant_id = EXCLUDED.benefit_covenant_id,
+            benefit_covenant_name = EXCLUDED.benefit_covenant_name,
+            benefit_registration_number = EXCLUDED.benefit_registration_number,
+            benefit_species = EXCLUDED.benefit_species,
+            benefit_species_name = EXCLUDED.benefit_species_name,
+            benefit_status = EXCLUDED.benefit_status,
+            benefit_status_name = EXCLUDED.benefit_status_name,
+            benefit_state = EXCLUDED.benefit_state,
+            benefit_dispatch_date = EXCLUDED.benefit_dispatch_date,
+            benefit_unblock_date = EXCLUDED.benefit_unblock_date,
+            benefit_margin = EXCLUDED.benefit_margin,
+            benefit_card_margin = EXCLUDED.benefit_card_margin,
+            benefit_calculation_base = EXCLUDED.benefit_calculation_base,
 
             bank_id = EXCLUDED.bank_id,
             bank_name = EXCLUDED.bank_name,
@@ -408,6 +457,7 @@ def upsert_propostas_lote(pg, linhas):
             endorsement_date = EXCLUDED.endorsement_date,
             cancellation_date = EXCLUDED.cancellation_date,
             completion_date = EXCLUDED.completion_date,
+            balance_return_date = EXCLUDED.balance_return_date,
 
             raw = EXCLUDED.raw,
             synced_at = NOW()
@@ -424,6 +474,8 @@ def upsert_propostas_lote(pg, linhas):
             (
                 %s, %s, %s,
                 %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s, %s,%s, %s,
@@ -431,7 +483,7 @@ def upsert_propostas_lote(pg, linhas):
                 %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s,
                 NOW()
             )

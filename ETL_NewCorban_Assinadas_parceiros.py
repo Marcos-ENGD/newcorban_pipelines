@@ -426,7 +426,7 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
     
     params_padrao = {
         "partner.code.ne": 41,
-        "SignatureDate.gte": '2026-08-27',
+        "SignatureDate.gte": '2026-09-14',
         "limit": api_limit,
     }
     params = dict(params_init) if isinstance(params_init, dict) else params_padrao
@@ -818,7 +818,7 @@ with DAG(
             "filtros": Param(
                 {
                     "partner.code.ne": 41,
-                    "SignatureDate.gte": "2026-08-25",
+                    "SignatureDate.gte": "2026-09-14",
                     "limit": 100,
                 },
                 type="object",

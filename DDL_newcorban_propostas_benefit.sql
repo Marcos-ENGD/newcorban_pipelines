@@ -1,0 +1,15 @@
+ALTER TABLE public.newcorban_propostas
+    ADD COLUMN IF NOT EXISTS benefit_id BIGINT,
+    ADD COLUMN IF NOT EXISTS benefit_covenant_id BIGINT,
+    ADD COLUMN IF NOT EXISTS benefit_covenant_name TEXT,
+    ADD COLUMN IF NOT EXISTS benefit_registration_number TEXT,
+    ADD COLUMN IF NOT EXISTS benefit_species BIGINT,
+    ADD COLUMN IF NOT EXISTS benefit_species_name TEXT,
+    ADD COLUMN IF NOT EXISTS benefit_status BIGINT,
+    ADD COLUMN IF NOT EXISTS benefit_status_name TEXT,
+    ADD COLUMN IF NOT EXISTS benefit_state TEXT,
+    ADD COLUMN IF NOT EXISTS benefit_dispatch_date TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS benefit_unblock_date TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS benefit_margin NUMERIC,
+    ADD COLUMN IF NOT EXISTS benefit_card_margin NUMERIC,
+    ADD COLUMN IF NOT EXISTS benefit_calculation_base NUMERIC;

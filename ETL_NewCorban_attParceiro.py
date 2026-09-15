@@ -365,22 +365,51 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
     now_sp = datetime.now(sp_tz)
 
     base_url = os.getenv("BASE_URL")
-    api_key = os.getenv("TKNV_AT_PARC")
+
+    token_env_names = (
+        "TKNV_AT_PARC",
+        "TKNV_AT_PARC_2",
+        "TKNV_AT_PARC_3",
+        "TKNV_PARCEIRO",
+        "TKNV",
+        "TKNV_ADONIS",
+        "TKNV_ADONIS3",
+    )
+    api_tokens = []
+    seen_tokens = set()
+    for token_name in token_env_names:
+        api_key = os.getenv(token_name)
+        api_key = api_key.strip() if api_key else ""
+        if not api_key or api_key in seen_tokens:
+            continue
+        seen_tokens.add(api_key)
+        api_tokens.append((token_name, api_key))
+        if len(api_tokens) == 3:
+            break
 
     if not base_url:
         raise ValueError("BASE_URL não definido no .env")
-    if not api_key:
-        raise ValueError("TKNV_AT_PARC  não definido no .env")
-
-    headers = {
-        "apikey": api_key,
-        "Content-Type": "application/json",
-    }
+    if not api_tokens:
+        raise ValueError(
+            "Nenhuma chave da API definida. Configure TKNV_AT_PARC e, "
+            "opcionalmente, TKNV_AT_PARC_2 e TKNV_AT_PARC_3."
+        )
 
     api_limit = getenv_int("NEWCORBAN_API_LIMIT", 100)
-    min_page_delay = getenv_float("NEWCORBAN_MIN_PAGE_DELAY_SECONDS", 4.2)
-    max_page_delay = getenv_float("NEWCORBAN_MAX_PAGE_DELAY_SECONDS", 20.0)
-    rate_limit_cooldown = getenv_float("NEWCORBAN_429_COOLDOWN_SECONDS", 45.0)
+    pages_per_token = max(1, getenv_int("NEWCORBAN_PAGES_PER_TOKEN", 12))
+    max_call_delay = 2.0
+    min_page_delay = min(
+        max_call_delay,
+        max(0.0, getenv_float("NEWCORBAN_MIN_PAGE_DELAY_SECONDS", 1.8)),
+    )
+    max_page_delay = min(
+        max_call_delay,
+        max(min_page_delay, getenv_float("NEWCORBAN_MAX_PAGE_DELAY_SECONDS", 2.0)),
+    )
+    rate_limit_cooldown = min(
+        max_call_delay,
+        max(0.0, getenv_float("NEWCORBAN_429_COOLDOWN_SECONDS", 2.0)),
+    )
     max_tentativas = getenv_int("NEWCORBAN_API_MAX_TENTATIVAS", 8)
 
     #####################################################################################################################################################################
@@ -388,11 +417,25 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
     params_padrao = {
         "status.code.ne": 30,
         "partner.code.ne": 41,
-         "LastUpdate.gte": '2026-08-30',    
+         "LastUpdate.gte": '2026-09-15',    
      "limit": api_limit,
     }
     params = dict(params_init) if isinstance(params_init, dict) else params_padrao
     params.setdefault("limit", api_limit)
+
+    logger.info(
+        "[API TOKENS] chaves=%s paginas_por_chave=%s",
+        [name for name, _ in api_tokens],
+        pages_per_token,
+    )
+
+    def get_headers_for_page(page_number):
+        token_index = ((page_number - 1) // pages_per_token) % len(api_tokens)
+        token_name, api_key = api_tokens[token_index]
+        return {
+            "apikey": api_key,
+            "Content-Type": "application/json",
+        }, token_name
     
     #####################################################################################################################################################################
 
@@ -439,6 +482,7 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
                     wait_seconds = rate_limit_cooldown
             else:
                 wait_seconds = min(2 ** tentativa, max_page_delay)
+            wait_seconds = min(max(wait_seconds, 0.0), max_call_delay)
 
             print(
                 f"[Retry {tentativa}] falhou ({resp.status_code}), aguardando {wait_seconds:.1f}s...\n"
@@ -580,7 +624,10 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
         if not lista_propostas:
             raise ValueError("Modo lista selecionado, mas nenhuma proposta foi informada.")
 
-        list_delay = getenv_float("NEWCORBAN_LIST_DELAY_SECONDS", 0.5)
+        list_delay = min(
+            max_call_delay,
+            max(0.0, getenv_float("NEWCORBAN_LIST_DELAY_SECONDS", 0.5)),
+        )
         linhas = []
         total = len(lista_propostas)
         logger.info("[MODO LISTA] Consultando %s proposta(s) por contract-number.", total)
@@ -588,7 +635,14 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
             if indice > 1 and list_delay > 0:
                 time.sleep(list_delay)
             endpoint_proposta = f"{CONTRACT_NUMBER_URL}/{quote(proposta, safe='')}"
-            logger.info("[MODO LISTA] [%s/%s] proposta=%s", indice, total, proposta)
+            headers, token_name = get_headers_for_page(indice)
+            logger.info(
+                "[MODO LISTA] [%s/%s] proposta=%s chave=%s",
+                indice,
+                total,
+                proposta,
+                token_name,
+            )
             data_proposta, _ = fetch_with_retry(endpoint_proposta, headers)
             item = data_proposta
             if isinstance(data_proposta, dict):
@@ -616,6 +670,8 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
     if modo_busca != "filtro":
         raise ValueError(f"modo_busca invalido: {modo_busca}. Use 'filtro' ou 'lista'.")
 
+    headers, token_name = get_headers_for_page(1)
+    logger.info("[API TOKENS] pagina=1 chave=%s", token_name)
     data, hit_rate_limit = fetch_with_retry(base_url, headers, params=params)
     scroll_id = data.get("scrollId")
     total_count = data.get("count", 0)
@@ -648,6 +704,8 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
 
         next_url = f"{base_url}/search/next/{scroll_id}"
         print(f"-- scroll-next #{rodada} -- url={(next_url[:70] + '...') if len(next_url) > 70 else next_url}")
+        headers, token_name = get_headers_for_page(rodada)
+        logger.info("[API TOKENS] pagina=%s chave=%s", rodada, token_name)
 
         try:
             data, hit_rate_limit = fetch_with_retry(next_url, headers)
@@ -726,7 +784,7 @@ with DAG(
                 {
                     "status.code.ne": 30,
                     "partner.code.ne": 41,
-                     "LastUpdate.gte": '2026-08-30',   
+                     "LastUpdate.gte": '2026-09-15',   
                     "limit": 100,
                 },
                 type="object", title="Filtros da busca normal",

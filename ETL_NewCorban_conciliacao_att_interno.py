@@ -34,7 +34,7 @@ FASE_AGUARDA_AVERBACAO = "Aguarda Averbação"
 FASE_CIP_RETORNADA = "CIP Retornada"
 FASE_AGUARDANDO_SALDO = "Aguardando Saldo"
 FASE_AGUARDANDO_SALDO_ID = 9148
-FASE_REPROVA_POS_CIP = "Reprova Pos-CIP"
+FASE_REPROVA_POS_CIP = "Reprova Pós-CIP"
 FASE_REPROVA_POS_CIP_ID = 9112
 MOTIVO_REPROVA_POS_CIP = "Reprova Pos-CIP"
 FASE_REPROVADA_CANCELADA = "Reprovada - Cancelada"
@@ -85,7 +85,7 @@ STATUS_REQUIRED_DATE_FIELD = {
 DEFAULT_OUTPUT_DIR = os.getenv("NEWCORBAN_CONCILIACAO_OUTPUT_DIR", "/home/qualiconsig")
 OUTPUT_FILE_NAME = os.getenv(
     "NEWCORBAN_CONCILIACAO_OUTPUT_FILE",
-    "conciliacao_newcorban_att_interno.xlsx",
+    "conciliacao_newcorban_att_intaaaaerno.xlsx",
 )
 FINANCIAL_PASSWORD = os.getenv("NEWCORBAN_FINANCIAL_PASSWORD")
 NEWCORBAN_TOKEN = 'nc_live_PsS9B39OC4kk2UoPShOCiksMOM8C5QwNbsUJFleH'
@@ -679,7 +679,7 @@ def load_dataframes(pg: PostgresHook):
             cpf,
             beneficio
         FROM {ATT_TABLE}
-        WHERE COALESCE(NULLIF(TRIM(af), ''), NULLIF(TRIM("numeroAde"), '')) IS NOT NULL
+        WHERE COALESCE(NULLIF(TRIM(af), ''), NULLIF(TRIM("numeroAde"), '')) IS NOT NULL 
 """
 
 
@@ -989,7 +989,7 @@ def build_conciliacao(
             FASE_REPROVA_POS_CIP,
             FASE_REPROVA_POS_CIP_ID,
             "reprova_pos_cip_forcada",
-            "Port + Refin em Reprova Pos-CIP; Port + Refin e Refin da Port forcados para Reprova Pos-CIP e travados nessa fase.",
+            "Port + Refin em Reprova Pós-CIP; Port + Refin e Refin da Port forcados para Reprova Pós-CIP e travados nessa fase.",
         )
 
     mask_reprova_pos_cip_travada = df["crm_status_norm"] == normalize_key(FASE_REPROVA_POS_CIP)
@@ -999,11 +999,15 @@ def build_conciliacao(
         FASE_REPROVA_POS_CIP,
         FASE_REPROVA_POS_CIP_ID,
         "reprova_pos_cip_travada",
-        "Proposta ja esta em Reprova Pos-CIP no CRM; fase travada para nao sair desse status.",
+        "Proposta ja esta em Reprova Pós-CIP no CRM; fase travada para nao sair desse status.",
     )
 
     mask_destino_reprova_pos_cip = (
         df["nw_fase_norm"] == normalize_key(FASE_REPROVA_POS_CIP)
+    )
+    df.loc[mask_destino_reprova_pos_cip, "nw_fase"] = FASE_REPROVA_POS_CIP
+    df.loc[mask_destino_reprova_pos_cip, "nw_fase_norm"] = normalize_key(
+        FASE_REPROVA_POS_CIP
     )
     for idx in df.index[mask_destino_reprova_pos_cip]:
         numero_contrato = df.at[idx, "numero_contrato_match"]
@@ -1778,31 +1782,58 @@ def build_conciliacao(
 def export_excel(df: pd.DataFrame, output_path: str) -> str:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    df_export = df.loc[
-        df["resultado"] == "falta_atualizar",
-        [
-            "proposta_id",
-            "bank_proposal_number",
-            "crm_status_name",
-            "nw_fase",
-            "crm_substatus",
-            "depara_motivo",
-        ],
-    ].copy()
-    df_export.columns = [
-        "proposta_sistema",
-        "proposta_banco_ade",
-        "fase_atual",
-        "fase_destino",
-        "substatus_atual",
-        "substatus_destino",
-    ]
-    df_export["proposta_sistema"] = pd.to_numeric(
-        df_export["proposta_sistema"], errors="coerce"
-    ).astype("Int64")
+    df_export = df.copy()
+
+    for col in df_export.columns:
+        if pd.api.types.is_datetime64_any_dtype(df_export[col]):
+            df_export[col] = pd.to_datetime(df_export[col], errors="coerce", utc=True)
+            df_export[col] = df_export[col].dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif df_export[col].dtype == object:
+            sample = df_export[col].dropna().head(20)
+            if not sample.empty and sample.map(lambda x: hasattr(x, "tzinfo") and x.tzinfo is not None).any():
+                df_export[col] = df_export[col].map(
+                    lambda x: x.tz_convert(None).strftime("%Y-%m-%d %H:%M:%S")
+                    if hasattr(x, "tz_convert")
+                    else x.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+                    if hasattr(x, "tzinfo") and x.tzinfo is not None
+                    else x
+                )
+
+    resumo = (
+        df_export.groupby("resultado", dropna=False)
+        .size()
+        .reset_index(name="quantidade")
+        .sort_values("resultado")
+    )
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df_export.to_excel(writer, sheet_name="propostas_atualizar", index=False)
+        resumo.to_excel(writer, sheet_name="resumo", index=False)
+        df_export.to_excel(writer, sheet_name="todos", index=False)
+        df_export[df_export["resultado"] == "falta_atualizar"].to_excel(
+            writer, sheet_name="falta_atualizar", index=False
+        )
+        df_export[df_export["update_payload_json"].notna()].to_excel(
+            writer, sheet_name="payload_atualizacao", index=False
+        )
+        df_export[df_export["api_executado"] == True].to_excel(
+            writer, sheet_name="retorno_api", index=False
+        )
+        df_export[df_export["formalizer_payload_json"].notna()].to_excel(
+            writer, sheet_name="limpar_formalizador", index=False
+        )
+        df_export[df_export["substatus_payload_json"].notna()].to_excel(
+            writer, sheet_name="substatus_motivo", index=False
+        )
+        df_export[df_export["resultado"] == "alteracao_barrada"].to_excel(
+            writer, sheet_name="alteracao_barrada", index=False
+        )
+        df_export[df_export["resultado"] == "igual"].to_excel(writer, sheet_name="iguais", index=False)
+        df_export[df_export["resultado"] == "sem_depara_fase"].to_excel(
+            writer, sheet_name="sem_depara", index=False
+        )
+        df_export[df_export["resultado"] == "sem_proposta_incremental"].to_excel(
+            writer, sheet_name="sem_proposta", index=False
+        )
 
     logger.info("[CONCILIACAO] XLSX gerado em: %s", path)
     return str(path)
