@@ -26,6 +26,9 @@ load_dotenv()
 
 POSTGRES_CONN_ID =  "246PGEsteiraQBCorban"
 FINAL_TABLE = "newcorban_insert_parceiros"
+SYNC_STATE_TABLE = "newcorban_sync_state"
+SYNC_STATE_NAME = "assinadas_parceiros_signature_date"
+DEFAULT_SIGNATURE_DATE_GTE = "2026-09-14T00:00:00"
 CONTRACT_NUMBER_URL = os.getenv(
     "NEWCORBAN_CONTRACT_NUMBER_URL",
     "https://integration.ajin.io/v3/loans/contract-number",
@@ -60,6 +63,7 @@ FINAL_COLUMNS = [
     ("numeroPropostaNu", "text"),
     ("contratoRefin", "text"),
     ("nomeTabela", "text"),
+    ("tipoProduto", "text"),
     ("dataContratoRefin", "timestamptz"),
     ("bancoRefin", "text"),
     ("bancoRefin_id", "bigint"),
@@ -166,6 +170,76 @@ def getenv_float(name: str, default: float) -> float:
         return float(os.getenv(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def format_api_datetime(value) -> str:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"Filtro de data invalido: {value!r}")
+    timestamp = parsed.to_pydatetime()
+    sao_paulo = pytz.timezone("America/Sao_Paulo")
+    if timestamp.tzinfo is None:
+        timestamp = sao_paulo.localize(timestamp)
+    else:
+        timestamp = timestamp.astimezone(sao_paulo)
+    return timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def get_incremental_signature_date() -> str:
+    initial_value = os.getenv("NEWCORBAN_ASSINADAS_INITIAL_SIGNATURE_DATE_GTE", DEFAULT_SIGNATURE_DATE_GTE)
+    overlap_seconds = max(0, getenv_int("NEWCORBAN_ASSINADAS_OVERLAP_SECONDS", 60))
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SYNC_STATE_TABLE} (
+                    nome TEXT PRIMARY KEY,
+                    updated_since TIMESTAMPTZ,
+                    last_cursor TEXT,
+                    last_run_at TIMESTAMPTZ
+                )
+                """
+            )
+            cur.execute(f"SELECT updated_since FROM {SYNC_STATE_TABLE} WHERE nome = %s", (SYNC_STATE_NAME,))
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                cur.execute(f"SELECT MAX(captured_at) FROM {qident(FINAL_TABLE)}")
+                fallback_row = cur.fetchone()
+                row = fallback_row if fallback_row and fallback_row[0] is not None else row
+        conn.commit()
+    finally:
+        conn.close()
+    if not row or row[0] is None:
+        return format_api_datetime(initial_value)
+    last_success = pd.to_datetime(row[0], errors="coerce")
+    if pd.isna(last_success):
+        logger.warning("[ASSINADAS PARCEIROS] Cursor invalido; usando data inicial: %s", initial_value)
+        return format_api_datetime(initial_value)
+    return format_api_datetime(last_success - timedelta(seconds=overlap_seconds))
+
+
+def save_incremental_signature_date(value) -> None:
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {SYNC_STATE_TABLE} (nome, updated_since, last_cursor, last_run_at)
+                VALUES (%s, %s, NULL, NOW())
+                ON CONFLICT (nome) DO UPDATE SET
+                    updated_since = EXCLUDED.updated_since,
+                    last_cursor = NULL,
+                    last_run_at = NOW()
+                """,
+                (SYNC_STATE_NAME, value),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def payload_hash(payload: dict) -> str:
@@ -291,11 +365,6 @@ def ensure_final_table_columns(conn):
         ("bloqueio_envio", "text"),
         ("bloqueio_envio_em", "timestamptz"),
     ]
-    add_columns_sql = ",\n            ".join(
-        f"ADD COLUMN IF NOT EXISTS {qident(col)} {sql_type}"
-        for col, sql_type in all_table_columns
-    )
-
     with conn.cursor() as cur:
         create_columns_sql = ",\n            ".join(
             f"{qident(col)} {sql_type}"
@@ -308,7 +377,12 @@ def ensure_final_table_columns(conn):
                 updated_at timestamptz NOT NULL DEFAULT now()
             );
         """)
-        cur.execute(f"ALTER TABLE {qident(FINAL_TABLE)}\n     {add_columns_sql};")
+        cur.execute(f"""
+            UPDATE {qident(FINAL_TABLE)}
+            SET {qident('tipoProduto')} = payload_raw #>> '{{product,type,name}}'
+            WHERE {qident('tipoProduto')} IS NULL
+              AND payload_raw IS NOT NULL
+        """)
         cur.execute(f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {qident(f"idx_{FINAL_TABLE}_numeroAde_unique")}
             ON {qident(FINAL_TABLE)} ({qident("numeroAde")})
@@ -426,11 +500,24 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
     
     params_padrao = {
         "partner.code.ne": 41,
-        "SignatureDate.gte": '2026-09-14',
         "limit": api_limit,
     }
-    params = dict(params_init) if isinstance(params_init, dict) else params_padrao
+    params = dict(params_padrao)
+    if isinstance(params_init, dict):
+        params.update(params_init)
     params.setdefault("limit", api_limit)
+    requested_signature_date = params.get("SignatureDate.gte")
+    automatic_signature_date = requested_signature_date is None
+    if automatic_signature_date:
+        requested_signature_date = get_incremental_signature_date()
+    else:
+        requested_signature_date = format_api_datetime(requested_signature_date)
+    params["SignatureDate.gte"] = requested_signature_date
+    logger.info(
+        "[ASSINADAS PARCEIROS] SignatureDate.gte=%s origem=%s",
+        requested_signature_date,
+        "cursor automatico" if automatic_signature_date else "filtro informado",
+    )
     
     #####################################################################################################################################################################
 
@@ -518,6 +605,7 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
             item = item or {}
 
             product = item.get("product") or {}
+            product_type = product.get("type") or {}
             operation = product.get("operation") or {}
             borrower = item.get("borrower") or {}
             borrowerBenefitT = borrower.get("benefitType") or {}
@@ -585,6 +673,7 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
                 "numeroPropostaNu": safe_int_str(origin.get("portabilityNumber")),
                 "contratoRefin": item.get("contractNumber"),
                 "nomeTabela": rule.get("name"),
+                "tipoProduto": product_type.get("name"),
                 "dataContratoRefin": status.get("date"),
                 "bancoRefin": lender.get("name"),
                 "bancoRefin_id": 554,
@@ -775,6 +864,8 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
         "params": params,
         "endpoint": base_url,
         "modo_busca": "filtro",
+        "signature_date_gte": requested_signature_date,
+        "automatic_signature_date": automatic_signature_date,
     }
 
 
@@ -818,7 +909,6 @@ with DAG(
             "filtros": Param(
                 {
                     "partner.code.ne": 41,
-                    "SignatureDate.gte": "2026-09-14",
                     "limit": 100,
                 },
                 type="object",
@@ -839,6 +929,7 @@ with DAG(
         )
 
         run_uuid = str(uuid.uuid4())
+        run_started_at = format_api_datetime(datetime.now(pytz.timezone("America/Sao_Paulo")))
         logger.info("[NEWCORBAN] Inicio run_uuid=%s modo_busca=%s", run_uuid, modo_busca)
 
         df_api, api_meta = correcao_api(
@@ -848,6 +939,9 @@ with DAG(
             propostas=propostas,
         )
         total_gravado = insert_newcorban_postgres(df_api)
+        if api_meta.get("modo_busca") == "filtro" and api_meta.get("automatic_signature_date"):
+            save_incremental_signature_date(run_started_at)
+            logger.info("[ASSINADAS PARCEIROS] Cursor incremental atualizado para %s", run_started_at)
 
         logger.info(
             "[NEWCORBAN] Finalizado run_uuid=%s | coletados=%s | paginas=%s | gravados=%s",
@@ -862,6 +956,7 @@ with DAG(
             "coletados": api_meta.get("total_items"),
             "paginas": api_meta.get("total_pages"),
             "gravados": total_gravado,
+            "signature_date_gte": api_meta.get("signature_date_gte"),
         }
 
     fetch_and_upsert_task = PythonOperator(

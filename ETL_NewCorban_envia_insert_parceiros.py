@@ -35,10 +35,12 @@ PROPOSAL_INSERTION_URL = os.getenv(
 DEFAULT_LIMIT = int(os.getenv("NEWCORBAN_INSERT_PARCEIROS_LIMIT", "400"))
 DEFAULT_DELAY_SECONDS = float(os.getenv("NEWCORBAN_INSERT_PARCEIROS_DELAY_SECONDS", "2"))
 DEFAULT_TIMEOUT_SECONDS = int(os.getenv("NEWCORBAN_INSERT_PARCEIROS_TIMEOUT_SECONDS", "60"))
+FGTS_PRODUCT_ID = 7
 
 TIPO_PRODUTO_MAP = {
     "NOVOS": "margem_livre",
     "NOVO": "margem_livre",
+    "FGTS": "fgts",
     "REFINANCIAMENTO": "refinanciamento",
     "PORT COM REDUCAO": "portabilidade",
     "PORT + REFIN": "port_com_refin",
@@ -115,6 +117,16 @@ def digitos_ou_none(value) -> str | None:
         return None
     digits = re.sub(r"\D", "", text)
     return digits or None
+
+
+def normalizar_numero_beneficio(value, max_length: int = 18) -> str | None:
+    numero = digitos_ou_none(value)
+    if numero is None or len(numero) <= max_length:
+        return numero
+
+    excesso = len(numero) - max_length
+    zeros_removiveis = len(numero) - len(numero.lstrip("0"))
+    return numero[min(excesso, zeros_removiveis):]
 
 
 def int_ou_none(value) -> int | None:
@@ -463,10 +475,35 @@ def atualizar_retorno(conn, numero_ade: str | None, status_code: int | None, ret
     conn.commit()
 
 
-def produto_key(row: dict) -> str:
+def tipo_efetivo(row: dict) -> str | None:
     tipo = texto_ou_none(row.get("tipo"))
+    tipo_produto = limpar_valores(row.get("tipoProduto"))
+    if (tipo or "").strip().upper() in {"NOVOS", "NOVO"} and tipo_produto == "fgts":
+        return "FGTS"
+    return tipo
+
+
+def produto_key(row: dict) -> str:
+    tipo = tipo_efetivo(row)
     mapped = TIPO_PRODUTO_MAP.get((tipo or "").upper(), tipo)
     return limpar_valores(mapped)
+
+
+def atualizar_tipo_fgts(conn, numero_ade: str | None) -> None:
+    if not numero_ade:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE public.{qident(SOURCE_TABLE)}
+            SET tipo = 'FGTS',
+                updated_at = NOW()
+            WHERE "numeroAde" = %s
+              AND tipo IS DISTINCT FROM 'FGTS'
+            """,
+            (numero_ade,),
+        )
+    conn.commit()
 
 
 def banco_key(row: dict) -> str:
@@ -491,7 +528,12 @@ def montar_payload(row: dict, mapas: dict) -> tuple[dict | None, str | None]:
         return None, f"FASE_NAO_ENCONTRADA: {TARGET_STATUS_NAME}"
 
     bank_id = int_ou_none(mapas["banks"].get(banco_key(row)))
-    product_id = int_ou_none(mapas["products"].get(produto_key(row)))
+    tipo_resolvido = tipo_efetivo(row)
+    if tipo_resolvido == "FGTS":
+        row["tipo"] = "FGTS"
+        product_id = FGTS_PRODUCT_ID
+    else:
+        product_id = int_ou_none(mapas["products"].get(produto_key(row)))
     covenant_id = int_ou_none(mapas["covenants"].get("inss")) or 7000
     franchise_id = user.get("franchise_id") or int_ou_none(mapas["franchises"].get(limpar_valores(row.get("plataforma"))))
     team_assignment = texto_ou_none(user.get("team_id"))
@@ -511,7 +553,9 @@ def montar_payload(row: dict, mapas: dict) -> tuple[dict | None, str | None]:
         }
 
     document_number = digitos_ou_none(row.get("documento") or nested_get(raw, "borrower", "document", "number")) or normalizar_cpf(row.get("cpf")) or "000000"
-    benefit = digitos_ou_none(row.get("beneficio") or nested_get(raw, "borrower", "benefit")) or "0000000000"
+    benefit = normalizar_numero_beneficio(
+        row.get("beneficio") or nested_get(raw, "borrower", "benefit")
+    ) or "0000000000"
     numero_ade = texto_ou_none(row.get("numeroAde"))
     customer_name = (
         texto_ou_none(nested_get(raw, "borrower", "name"))
@@ -732,6 +776,15 @@ def processar_insert_parceiros(limit: int = DEFAULT_LIMIT, delay_seconds: float 
         tentativas = 0
         for index, row in enumerate(rows, start=1):
             numero_ade = texto_ou_none(row.get("numeroAde"))
+
+            if tipo_efetivo(row) == "FGTS":
+                row["tipo"] = "FGTS"
+                atualizar_tipo_fgts(source_conn, numero_ade)
+                logger.info(
+                    "[INSERT PARCEIROS] Regra FGTS aplicada numeroAde=%s product_id=%s",
+                    numero_ade,
+                    FGTS_PRODUCT_ID,
+                )
 
             if numero_ade in propostas_ja_existentes:
                 bloquear_linha(

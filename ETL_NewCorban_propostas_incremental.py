@@ -6,6 +6,7 @@ import os
 
 load_dotenv()
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import requests
 import time
 import json
@@ -21,6 +22,7 @@ BASE_URL = "https://developers.newcorban.com.br/v1/proposals"
 PER_PAGE = 200
 
 DEFAULT_UPDATED_SINCE = "2026-06-01T00:00:00-03:00"
+SAO_PAULO_TZ = ZoneInfo("America/Sao_Paulo")
 
 
 def get_token():
@@ -43,11 +45,30 @@ def get_state(pg):
     if not row:
         return DEFAULT_UPDATED_SINCE, None
 
-    updated_since = row[0]
-    if hasattr(updated_since, "isoformat"):
-        updated_since = updated_since.isoformat()
+    updated_since = checkpoint_datetime(row[0])
+    if updated_since is None:
+        return DEFAULT_UPDATED_SINCE, row[1]
 
-    return updated_since, row[1]
+    # Versoes anteriores gravavam um horario UTC com o sufixo -03:00 sem
+    # converter o relogio. Se o cursor ficou no futuro, voltamos quatro horas
+    # para recuperar os contratos possivelmente pulados.
+    now_sp = datetime.now(SAO_PAULO_TZ)
+    if updated_since > now_sp:
+        recovered_since = now_sp - timedelta(hours=4)
+        print(
+            "[CHECKPOINT] Cursor futuro detectado "
+            f"({updated_since.isoformat()}); recuperando desde {recovered_since.isoformat()}."
+        )
+        updated_since = recovered_since
+
+    stored_updated_since = updated_since
+    updated_since = stored_updated_since - timedelta(hours=1)
+    print(
+        "[CHECKPOINT] Janela de seguranca de 1 hora aplicada: "
+        f"salvo={stored_updated_since.isoformat()} consulta={updated_since.isoformat()}"
+    )
+
+    return updated_since.isoformat(), row[1]
 
 
 def save_state(pg, updated_since, cursor):
@@ -174,6 +195,16 @@ def parse_api_datetime(value):
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+
+
+def checkpoint_datetime(value):
+    """Converte timestamps da API para Sao Paulo antes de formar o cursor."""
+    parsed = parse_api_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=SAO_PAULO_TZ)
+    return parsed.astimezone(SAO_PAULO_TZ)
 
 
 def normalize_table_code(value):
@@ -540,8 +571,11 @@ def sync_newcorban_propostas(**context):
 
             item_updated_at = (item.get("dates") or {}).get("updated_at")
             if item_updated_at:
-                if maior_updated_at is None or item_updated_at > maior_updated_at:
-                    maior_updated_at = item_updated_at
+                item_updated_at_dt = checkpoint_datetime(item_updated_at)
+                if item_updated_at_dt is None:
+                    print(f"[CHECKPOINT] updated_at invalido ignorado: {item_updated_at!r}")
+                elif maior_updated_at is None or item_updated_at_dt > maior_updated_at:
+                    maior_updated_at = item_updated_at_dt
 
         print(f"[INSERT LOTE] Inserindo/atualizando {len(linhas_para_insert)} propostas em lote...")
         upsert_propostas_lote(pg, linhas_para_insert)
@@ -555,11 +589,9 @@ def sync_newcorban_propostas(**context):
         cursor = next_cursor
 
     if maior_updated_at:
-        dt = parse_api_datetime(maior_updated_at)
-
         novo_updated_since = (
-            dt - timedelta(minutes=2)
-        ).strftime("%Y-%m-%dT%H:%M:%S-03:00")
+            maior_updated_at - timedelta(minutes=2)
+        ).isoformat(timespec="seconds")
 
         save_state(pg, novo_updated_since, None)
 

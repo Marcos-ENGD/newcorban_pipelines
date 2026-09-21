@@ -24,6 +24,9 @@ load_dotenv()
 
 POSTGRES_CONN_ID =  "246PGEsteiraQBCorban"
 FINAL_TABLE = "newcorban_att_interno"
+SYNC_STATE_TABLE = "newcorban_sync_state"
+SYNC_STATE_NAME = "att_interno_status_date"
+DEFAULT_STATUS_DATE_GTE = "2026-09-15T00:00:00"
 
 TIPO_MAP = {
     1: "Novos",
@@ -135,6 +138,100 @@ def getenv_float(name: str, default: float) -> float:
         return float(os.getenv(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def format_status_date_gte(value) -> str:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"status.date.gte invalido: {value!r}")
+    timestamp = parsed.to_pydatetime()
+    sao_paulo = pytz.timezone("America/Sao_Paulo")
+    if timestamp.tzinfo is None:
+        timestamp = sao_paulo.localize(timestamp)
+    else:
+        timestamp = timestamp.astimezone(sao_paulo)
+    return timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def get_incremental_status_date() -> str:
+    initial_value = os.getenv("NEWCORBAN_ATT_INT_INITIAL_STATUS_DATE_GTE", DEFAULT_STATUS_DATE_GTE)
+    overlap_seconds = max(0, getenv_int("NEWCORBAN_ATT_INT_OVERLAP_SECONDS", 60))
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SYNC_STATE_TABLE} (
+                    nome TEXT PRIMARY KEY,
+                    updated_since TIMESTAMPTZ,
+                    last_cursor TEXT,
+                    last_run_at TIMESTAMPTZ
+                )
+                """
+            )
+            cur.execute(
+                f"SELECT updated_since FROM {SYNC_STATE_TABLE} WHERE nome = %s",
+                (SYNC_STATE_NAME,),
+            )
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                cur.execute(f"SELECT MAX(captured_at) FROM {qident(FINAL_TABLE)}")
+                fallback_row = cur.fetchone()
+                row = fallback_row if fallback_row and fallback_row[0] is not None else row
+        conn.commit()
+    finally:
+        conn.close()
+    if not row or row[0] is None:
+        return format_status_date_gte(initial_value)
+    last_success = pd.to_datetime(row[0], errors="coerce")
+    if pd.isna(last_success):
+        logger.warning("[NEWCORBAN] Cursor invalido; usando data inicial: %s", initial_value)
+        return format_status_date_gte(initial_value)
+    return format_status_date_gte(last_success - timedelta(seconds=overlap_seconds))
+
+
+def save_incremental_status_date(value) -> None:
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {SYNC_STATE_TABLE} (nome, updated_since, last_cursor, last_run_at)
+                VALUES (%s, %s, NULL, NOW())
+                ON CONFLICT (nome) DO UPDATE SET
+                    updated_since = EXCLUDED.updated_since,
+                    last_cursor = NULL,
+                    last_run_at = NOW()
+                """,
+                (SYNC_STATE_NAME, value),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def status_date_gte_from_filters(filters: dict) -> str | None:
+    status = filters.get("status") if isinstance(filters.get("status"), dict) else {}
+    date = status.get("date") if isinstance(status.get("date"), dict) else {}
+    return date.get("gte") or filters.get("status.date.gte")
+
+
+def flatten_api_filters(filters: dict) -> dict:
+    flattened = {}
+
+    def visit(value, path):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(child, path + [str(key)])
+        else:
+            flattened[".".join(path)] = value
+
+    for key, value in filters.items():
+        visit(value, [str(key)])
+    return flattened
 
 
 def payload_hash(payload: dict) -> str:
@@ -366,14 +463,31 @@ def correcao_api(params_init=None, run_uuid=None):
 
     #####################################################################################################################################################################
     
-    params = {
+    params_padrao = {
         "status.code.ne": 30,
         "partner.code.eq": 41,
-        "LastUpdate.gte": '2026-09-15',
         "limit": api_limit,
     }
-
+    params = dict(params_padrao)
+    if isinstance(params_init, dict):
+        params.update(flatten_api_filters(params_init))
     params.setdefault("limit", api_limit)
+    params.pop("LastUpdate.gte", None)
+
+    requested_status_date = params.get("status.date.gte")
+    automatic_status_date = requested_status_date is None
+    if automatic_status_date:
+        requested_status_date = get_incremental_status_date()
+    else:
+        requested_status_date = format_status_date_gte(requested_status_date)
+    params["status.date.gte"] = requested_status_date
+    request_params = params
+    logger.info(
+        "[NEWCORBAN INTERNO] status.date.gte=%s origem=%s",
+        requested_status_date,
+        "cursor automatico" if automatic_status_date else "filtro informado",
+    )
+    logger.info("[NEWCORBAN INTERNO] parametros enviados para API=%s", request_params)
     
     #####################################################################################################################################################################
 
@@ -555,7 +669,7 @@ def correcao_api(params_init=None, run_uuid=None):
 
         return rows
 
-    data, hit_rate_limit = fetch_with_retry(base_url, headers, params=params)
+    data, hit_rate_limit = fetch_with_retry(base_url, headers, params=request_params)
     scroll_id = data.get("scrollId")
     total_count = data.get("count", 0)
 
@@ -624,6 +738,8 @@ def correcao_api(params_init=None, run_uuid=None):
         "total_pages": total_pages,
         "params": params,
         "endpoint": base_url,
+        "status_date_gte": requested_status_date,
+        "automatic_status_date": automatic_status_date,
     }
 
 
@@ -658,10 +774,14 @@ with DAG(
             params_init = dag_run.conf.get("params")
 
         run_uuid = str(uuid.uuid4())
+        run_started_at = format_status_date_gte(datetime.now(pytz.timezone("America/Sao_Paulo")))
         logger.info(f"[NEWCORBAN] Inicio run_uuid={run_uuid}")
 
         df_api, api_meta = correcao_api(params_init=params_init, run_uuid=run_uuid)
         total_gravado = upsert_newcorban_postgres(df_api)
+        if api_meta.get("automatic_status_date"):
+            save_incremental_status_date(run_started_at)
+            logger.info("[NEWCORBAN INTERNO] Cursor incremental atualizado para %s", run_started_at)
 
         logger.info(
             "[NEWCORBAN] Finalizado run_uuid=%s | coletados=%s | paginas=%s | gravados=%s",
@@ -676,6 +796,7 @@ with DAG(
             "coletados": api_meta.get("total_items"),
             "paginas": api_meta.get("total_pages"),
             "gravados": total_gravado,
+            "status_date_gte": api_meta.get("status_date_gte"),
         }
 
     fetch_and_upsert_task = PythonOperator(

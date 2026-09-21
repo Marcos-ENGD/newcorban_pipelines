@@ -345,6 +345,20 @@ def build_update_payload_error(row: pd.Series):
     return None
 
 
+def garantir_substatus_reprova_pos_cip(row: pd.Series, payload: dict | None) -> dict | None:
+    """Garante o motivo exigido no ultimo instante antes do envio do status."""
+    if not isinstance(payload, dict):
+        return payload
+    if normalize_key(row.get("nw_fase")) != normalize_key(FASE_REPROVA_POS_CIP):
+        return payload
+    if clean_text_value(payload.get("substatus")):
+        return payload
+
+    payload = dict(payload)
+    payload["substatus"] = MOTIVO_REPROVA_POS_CIP
+    return payload
+
+
 def precisa_limpar_formalizador(row: pd.Series) -> bool:
     if row.get("resultado") != "falta_atualizar":
         return False
@@ -791,6 +805,40 @@ def escolher_depara(row: pd.Series, fases_df: pd.DataFrame) -> pd.Series:
     })
 
 
+def escolher_depara_em_lote(df_att: pd.DataFrame, fases_df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula o de-para uma vez para cada combinacao distinta de entrada."""
+    keys = [
+        (
+            None if pd.isna(fase_id) else int(fase_id),
+            "" if pd.isna(produto_norm) else str(produto_norm),
+            "" if pd.isna(nota_norm) else str(nota_norm),
+        )
+        for fase_id, produto_norm, nota_norm in zip(
+            df_att["fase_id"],
+            df_att["produto_norm"],
+            df_att["nota_status_norm"],
+        )
+    ]
+    cache = {}
+    for fase_id, produto_norm, nota_norm in dict.fromkeys(keys):
+        row = pd.Series({
+            "fase_id": fase_id,
+            "produto_norm": produto_norm,
+            "nota_status_norm": nota_norm,
+        })
+        cache[(fase_id, produto_norm, nota_norm)] = escolher_depara(row, fases_df).to_dict()
+
+    logger.info(
+        "[CONCILIACAO] De-para: linhas=%s combinacoes_unicas=%s",
+        len(keys),
+        len(cache),
+    )
+    return pd.DataFrame(
+        [cache[key] for key in keys],
+        index=df_att.index,
+    )
+
+
 def build_conciliacao(
     df_att: pd.DataFrame,
     df_fases: pd.DataFrame,
@@ -816,8 +864,13 @@ def build_conciliacao(
     df_fases["produto_depara_norm"] = get_series(df_fases, "produto").map(normaliza_produto_depara)
     df_fases["motivo_norm"] = get_series(df_fases, "motivo").apply(normalize_text)
 
-    depara = df_att.apply(lambda row: escolher_depara(row, df_fases), axis=1)
+    started_depara = time.perf_counter()
+    depara = escolher_depara_em_lote(df_att, df_fases)
     df = pd.concat([df_att, depara], axis=1)
+    logger.info(
+        "[CONCILIACAO] Tempo de-para: %.2fs",
+        time.perf_counter() - started_depara,
+    )
 
     df_prop["af_match"] = get_series(df_prop, "bank_proposal_number").apply(normalize_af)
     df_prop = (
@@ -1509,10 +1562,18 @@ def build_conciliacao(
         "observacao_regra",
     ] = "Proposta em Margem Negativa – Saldo Pago no CRM; conciliacao bloqueada para nao alterar a fase."
 
+    started_payloads = time.perf_counter()
+    mask_falta_atualizar = df["resultado"] == "falta_atualizar"
     df["api_method"] = None
     df["api_endpoint"] = None
-    df["update_payload_erro"] = df.apply(build_update_payload_error, axis=1)
-    df["update_payload"] = df.apply(build_update_payload, axis=1)
+    df["update_payload_erro"] = None
+    df["update_payload"] = None
+    df.loc[mask_falta_atualizar, "update_payload_erro"] = df.loc[
+        mask_falta_atualizar
+    ].apply(build_update_payload_error, axis=1)
+    df.loc[mask_falta_atualizar, "update_payload"] = df.loc[
+        mask_falta_atualizar
+    ].apply(build_update_payload, axis=1)
     mask_tem_payload = df["update_payload"].notna()
     df.loc[mask_tem_payload, "api_method"] = "PUT"
     df.loc[mask_tem_payload, "api_endpoint"] = df.loc[mask_tem_payload, "proposta_id"].map(
@@ -1528,7 +1589,10 @@ def build_conciliacao(
         if isinstance(payload, dict)
         else None
     )
-    df["formalizer_payload"] = df.apply(build_clear_formalizer_payload, axis=1)
+    df["formalizer_payload"] = None
+    df.loc[mask_falta_atualizar, "formalizer_payload"] = df.loc[
+        mask_falta_atualizar
+    ].apply(build_clear_formalizer_payload, axis=1)
     df["formalizer_endpoint"] = None
     mask_tem_formalizer_payload = df["formalizer_payload"].notna()
     df.loc[mask_tem_formalizer_payload, "formalizer_endpoint"] = df.loc[
@@ -1541,7 +1605,10 @@ def build_conciliacao(
     df["formalizer_payload_json"] = df["formalizer_payload"].map(
         lambda payload: json.dumps(payload, ensure_ascii=False, default=str) if isinstance(payload, dict) else None
     )
-    df["substatus_payload"] = df.apply(build_substatus_payload, axis=1)
+    df["substatus_payload"] = None
+    df.loc[mask_falta_atualizar, "substatus_payload"] = df.loc[
+        mask_falta_atualizar
+    ].apply(build_substatus_payload, axis=1)
     df["substatus_endpoint"] = None
     mask_tem_substatus_payload = df["substatus_payload"].notna()
     df.loc[mask_tem_substatus_payload, "substatus_endpoint"] = df.loc[
@@ -1580,6 +1647,11 @@ def build_conciliacao(
     df["substatus_erro"] = None
     df["substatus_ratelimit_remaining"] = None
     df["substatus_sleep_seconds"] = None
+    logger.info(
+        "[CONCILIACAO] Tempo payloads: %.2fs linhas_avaliadas=%s",
+        time.perf_counter() - started_payloads,
+        int(mask_falta_atualizar.sum()),
+    )
 
     if executar_api:
         if not token:
@@ -1632,7 +1704,23 @@ def build_conciliacao(
                 )
                 time.sleep(API_MIN_DELAY_SECONDS)
 
-            payload_status = df.at[idx, "update_payload"]
+            payload_status = garantir_substatus_reprova_pos_cip(
+                df.loc[idx],
+                df.at[idx, "update_payload"],
+            )
+            if payload_status is not df.at[idx, "update_payload"]:
+                df.at[idx, "update_payload"] = payload_status
+                df.at[idx, "update_payload_json"] = json.dumps(
+                    payload_status,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                if not clean_text_value(df.at[idx, "depara_motivo"]):
+                    df.at[idx, "depara_motivo"] = MOTIVO_REPROVA_POS_CIP
+                logger.info(
+                    "[API STATUS] Substatus padrao aplicado para Reprova Pos-CIP: proposta_id=%s",
+                    df.at[idx, "proposta_id"],
+                )
             logger.info(
                 "[API STATUS] ENVIANDO proposta_id=%s fase=%s fase_id=%s substatus=%s",
                 df.at[idx, "proposta_id"],
