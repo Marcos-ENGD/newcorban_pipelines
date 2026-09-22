@@ -1391,6 +1391,26 @@ def build_conciliacao(
         "observacao_regra",
     ] = "Proposta em Inconsistencia CIP retornada no CRM nao pode ser atualizada para CIP Retornada pela conciliacao."
 
+    mask_reprova_pos_cip_retorno_barrado = (
+        (df["resultado"] == "falta_atualizar")
+        & (df["crm_status_norm"] == normalize_key(FASE_REPROVA_POS_CIP))
+        & (
+            df["nw_fase_norm"].isin([
+                normalize_key(FASE_CIP_RETORNADA),
+                normalize_key(FASE_INCONSISTENCIA_CIP_RETORNADA),
+            ])
+        )
+    )
+    df.loc[mask_reprova_pos_cip_retorno_barrado, "resultado"] = "alteracao_barrada"
+    df.loc[
+        mask_reprova_pos_cip_retorno_barrado,
+        "regra_conciliacao",
+    ] = "reprova_pos_cip_retorno_barrado"
+    df.loc[
+        mask_reprova_pos_cip_retorno_barrado,
+        "observacao_regra",
+    ] = "Proposta em Reprova Pos-CIP no CRM nao pode retornar para CIP Retornada nem para Inconsistencia CIP retornada."
+
     df.loc[mask_banco_aguardando_supervisor, "resultado"] = "alteracao_barrada"
     df.loc[mask_banco_aguardando_supervisor, "regra_conciliacao"] = "aguardando_supervisor_banco_barrada"
     df.loc[
@@ -2021,14 +2041,12 @@ def gerar_conciliacao_att_interno(**context):
         token=NEWCORBAN_TOKEN,
     )
     auditoria_atualizacoes = registrar_auditoria_atualizacoes(pg, df) if executar_api else 0
-    output_path = str(Path(output_dir) / output_file)
-    export_path = export_excel(df, output_path)
 
     resumo = df["resultado"].value_counts(dropna=False).to_dict()
     logger.info("[CONCILIACAO] Resumo: %s", resumo)
 
     return {
-        "arquivo": export_path,
+        "arquivo": None,
         "total": int(len(df)),
         "iguais": int((df["resultado"] == "igual").sum()),
         "falta_atualizar": int((df["resultado"] == "falta_atualizar").sum()),

@@ -101,9 +101,9 @@ FINANCIAL_PASSWORD = os.getenv("NEWCORBAN_FINANCIAL_PASSWORD")
 NEWCORBAN_TOKEN = 'nc_live_PsS9B39OC4kk2UoPShOCiksMOM8C5QwNbsUJFleH'
 API_TIMEOUT_SECONDS = int(os.getenv("NEWCORBAN_STATUS_API_TIMEOUT_SECONDS", "60"))
 
-API_MIN_DELAY_SECONDS = 1.9
+API_MIN_DELAY_SECONDS = 1.6
 API_RATE_LIMIT_MIN_REMAINING = 10
-API_RATE_LIMIT_MAX_SLEEP_SECONDS = 2.1
+API_RATE_LIMIT_MAX_SLEEP_SECONDS = 1.9
 
 
 
@@ -696,7 +696,7 @@ def load_dataframes(pg: PostgresHook):
             cpf,
             beneficio
         FROM {ATT_TABLE}
-        WHERE COALESCE(NULLIF(TRIM(af), ''), NULLIF(TRIM("numeroAde"), '')) IS NOT NULL and "dataContratoRefin" >= '2026-09-07'
+        WHERE COALESCE(NULLIF(TRIM(af), ''), NULLIF(TRIM("numeroAde"), '')) IS NOT NULL and "dataContratoRefin" >= '2026-09-10'
 """
 
 
@@ -1391,6 +1391,26 @@ def build_conciliacao(
         "observacao_regra",
     ] = "Proposta em Inconsistencia CIP retornada no CRM nao pode ser atualizada para CIP Retornada pela conciliacao."
 
+    mask_reprova_pos_cip_retorno_barrado = (
+        (df["resultado"] == "falta_atualizar")
+        & (df["crm_status_norm"] == normalize_key(FASE_REPROVA_POS_CIP))
+        & (
+            df["nw_fase_norm"].isin([
+                normalize_key(FASE_CIP_RETORNADA),
+                normalize_key(FASE_INCONSISTENCIA_CIP_RETORNADA),
+            ])
+        )
+    )
+    df.loc[mask_reprova_pos_cip_retorno_barrado, "resultado"] = "alteracao_barrada"
+    df.loc[
+        mask_reprova_pos_cip_retorno_barrado,
+        "regra_conciliacao",
+    ] = "reprova_pos_cip_retorno_barrado"
+    df.loc[
+        mask_reprova_pos_cip_retorno_barrado,
+        "observacao_regra",
+    ] = "Proposta em Reprova Pos-CIP no CRM nao pode retornar para CIP Retornada nem para Inconsistencia CIP retornada."
+
     df.loc[mask_banco_aguardando_supervisor, "resultado"] = "alteracao_barrada"
     df.loc[mask_banco_aguardando_supervisor, "regra_conciliacao"] = "aguardando_supervisor_banco_barrada"
     df.loc[
@@ -1652,6 +1672,12 @@ def build_conciliacao(
         time.perf_counter() - started_payloads,
         int(mask_falta_atualizar.sum()),
     )
+
+    if output_path:
+        logger.info(
+            "[CONCILIACAO] Gerando XLSX inicial antes das atualizacoes via API."
+        )
+        export_excel(df, output_path)
 
     if executar_api:
         if not token:
