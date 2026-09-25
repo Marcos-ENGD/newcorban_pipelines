@@ -3,6 +3,7 @@ from airflow.utils.dates import days_ago
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 import sys
 from pathlib import Path
 from airflow.utils.log.logging_mixin import LoggingMixin
@@ -187,7 +188,7 @@ def format_api_datetime(value) -> str:
 
 def get_incremental_signature_date() -> str:
     initial_value = os.getenv("NEWCORBAN_ASSINADAS_INITIAL_SIGNATURE_DATE_GTE", DEFAULT_SIGNATURE_DATE_GTE)
-    overlap_seconds = max(0, getenv_int("NEWCORBAN_ASSINADAS_OVERLAP_SECONDS", 60))
+    overlap_seconds = max(0, getenv_int("NEWCORBAN_ASSINADAS_OVERLAP_SECONDS", 900))
     conn = get_pg_conn()
     try:
         with conn.cursor() as cur:
@@ -203,10 +204,6 @@ def get_incremental_signature_date() -> str:
             )
             cur.execute(f"SELECT updated_since FROM {SYNC_STATE_TABLE} WHERE nome = %s", (SYNC_STATE_NAME,))
             row = cur.fetchone()
-            if not row or row[0] is None:
-                cur.execute(f"SELECT MAX(captured_at) FROM {qident(FINAL_TABLE)}")
-                fallback_row = cur.fetchone()
-                row = fallback_row if fallback_row and fallback_row[0] is not None else row
         conn.commit()
     finally:
         conn.close()
@@ -412,6 +409,11 @@ def insert_newcorban_postgres(df: pd.DataFrame) -> int:
         "%s::jsonb" if col in ("payload_raw", "source_params") else "%s"
         for col in all_columns
     )
+    update_columns = [col for col in all_columns if col != "numeroAde"]
+    update_sql = ",\n        ".join(
+        f"{qident(col)} = EXCLUDED.{qident(col)}"
+        for col in update_columns
+    )
     sql = f"""
     INSERT INTO {qident(FINAL_TABLE)} (
         {insert_columns_sql}
@@ -420,7 +422,11 @@ def insert_newcorban_postgres(df: pd.DataFrame) -> int:
     )
     ON CONFLICT ({qident("numeroAde")})
     WHERE {qident("numeroAde")} IS NOT NULL
-    DO NOTHING;
+    DO UPDATE SET
+        {update_sql},
+        updated_at = now()
+    WHERE {qident(FINAL_TABLE)}.{qident("payload_hash")}
+        IS DISTINCT FROM EXCLUDED.{qident("payload_hash")};
     """
 
     rows = []
@@ -435,7 +441,11 @@ def insert_newcorban_postgres(df: pd.DataFrame) -> int:
         cur.executemany(sql, rows)
         affected_count = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
         conn.commit()
-        logger.info(f"[INSERT NEWCORBAN] {len(rows)} registros enviados | {affected_count} inseridos novos.")
+        logger.info(
+            "[UPSERT NEWCORBAN] %s registros enviados | %s inseridos/atualizados.",
+            len(rows),
+            affected_count,
+        )
         return affected_count
     except Exception as e:
         conn.rollback()
@@ -471,7 +481,15 @@ def normalizar_lista_propostas(value) -> list[str]:
     return resultado
 
 
-def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas=None):
+def correcao_api(
+    params_init=None,
+    run_uuid=None,
+    modo_busca="filtro",
+    propostas=None,
+    usar_cursor_incremental=True,
+    signature_date_gte=None,
+    signature_date_lt=None,
+):
     load_dotenv()
 
     sp_tz = pytz.timezone("America/Sao_Paulo")
@@ -506,17 +524,40 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
     if isinstance(params_init, dict):
         params.update(params_init)
     params.setdefault("limit", api_limit)
-    requested_signature_date = params.get("SignatureDate.gte")
-    automatic_signature_date = requested_signature_date is None
-    if automatic_signature_date:
-        requested_signature_date = get_incremental_signature_date()
-    else:
+    requested_signature_date = signature_date_gte or params.get("SignatureDate.gte")
+    requested_signature_date_lt = signature_date_lt or params.get("SignatureDate.lt")
+    automatic_signature_date = bool(usar_cursor_incremental)
+
+    if usar_cursor_incremental:
+        if requested_signature_date is None:
+            requested_signature_date = get_incremental_signature_date()
+        if requested_signature_date_lt is None:
+            safety_lag_seconds = max(
+                0,
+                getenv_int("NEWCORBAN_ASSINADAS_SAFETY_LAG_SECONDS", 300),
+            )
+            requested_signature_date_lt = now_sp - timedelta(seconds=safety_lag_seconds)
+
+    if requested_signature_date is not None:
         requested_signature_date = format_api_datetime(requested_signature_date)
-    params["SignatureDate.gte"] = requested_signature_date
+        params["SignatureDate.gte"] = requested_signature_date
+    else:
+        params.pop("SignatureDate.gte", None)
+
+    if requested_signature_date_lt is not None:
+        requested_signature_date_lt = format_api_datetime(requested_signature_date_lt)
+        params["SignatureDate.lt"] = requested_signature_date_lt
+    else:
+        params.pop("SignatureDate.lt", None)
+
+    signature_date_origin = (
+        "cursor automatico" if automatic_signature_date else "filtro informado/manual"
+    )
     logger.info(
-        "[ASSINADAS PARCEIROS] SignatureDate.gte=%s origem=%s",
+        "[ASSINADAS PARCEIROS] SignatureDate.gte=%s | SignatureDate.lt=%s | origem=%s",
         requested_signature_date,
-        "cursor automatico" if automatic_signature_date else "filtro informado",
+        requested_signature_date_lt,
+        signature_date_origin,
     )
     
     #####################################################################################################################################################################
@@ -796,7 +837,11 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
 
     data, hit_rate_limit = fetch_with_retry(base_url, headers, params=params)
     scroll_id = data.get("scrollId")
-    total_count = data.get("count", 0)
+    total_count_raw = data.get("count", 0)
+    try:
+        total_count = int(total_count_raw or 0)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"A API retornou um count invalido: {total_count_raw!r}")
 
     logger.info(f"Total estimado: {total_count} registros (scroll).")
 
@@ -807,6 +852,13 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
     total_pages += 1
 
     linhas.extend(extract_rows(itens0, total_pages, scroll_id))
+
+    if total_count > len(linhas) and not scroll_id:
+        raise RuntimeError(
+            "Captura incompleta: a primeira resposta informou "
+            f"{total_count} registro(s), retornou {len(linhas)} e nao forneceu scrollId. "
+            "O cursor nao sera atualizado."
+        )
 
     print(f"Página 1: extraídos {len(itens0)} itens | scroll_id={(str(scroll_id)[:12] + '...') if scroll_id else None}")
 
@@ -858,6 +910,12 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
         linhas.extend(extract_rows(items, total_pages, scroll_id))
 
     print(f"\nTotal de registros coletados: {len(linhas)}")
+    if len(linhas) != total_count:
+        raise RuntimeError(
+            "Captura incompleta: a API informou "
+            f"{total_count} registro(s), mas foram coletados {len(linhas)}. "
+            "O cursor nao sera atualizado."
+        )
     return pd.DataFrame(linhas), {
         "total_items": len(linhas),
         "total_pages": total_pages,
@@ -865,6 +923,7 @@ def correcao_api(params_init=None, run_uuid=None, modo_busca="filtro", propostas
         "endpoint": base_url,
         "modo_busca": "filtro",
         "signature_date_gte": requested_signature_date,
+        "signature_date_lt": requested_signature_date_lt,
         "automatic_signature_date": automatic_signature_date,
     }
 
@@ -890,7 +949,7 @@ with DAG(
         schedule_interval="*/5 * * * *",
         catchup=False,
         max_active_runs=1,
-        description='Captura NewCorban/Agilus e grava no Postgres uma vez por numeroAde',
+        description='Captura assinaturas NewCorban/Agilus e faz upsert no Postgres por numeroAde',
         tags=['newcorban', 'agilus', 'postgres', 'etl'],
         params={
             "modo_busca": Param(
@@ -913,6 +972,10 @@ with DAG(
                 },
                 type="object",
                 title="Filtros da busca normal",
+                description=(
+                    "Na execucao manual, os filtros sao usados exatamente como informados. "
+                    "Sem SignatureDate.gte, a busca nao recebe recorte automatico por data."
+                ),
             ),
         },
 ) as dag:
@@ -920,28 +983,62 @@ with DAG(
         dag_run = context.get("dag_run")
         dag_params = context.get("params") or {}
         run_conf = dict(dag_run.conf or {}) if dag_run and getattr(dag_run, "conf", None) else {}
-        modo_busca = run_conf.get("modo_busca", dag_params.get("modo_busca", "filtro"))
-        propostas = run_conf.get("propostas", dag_params.get("propostas", ""))
-        params_init = (
-            run_conf.get("filtros")
-            or run_conf.get("params")  # compatibilidade com execucoes antigas
-            or dag_params.get("filtros")
+        run_type = str(getattr(dag_run, "run_type", "") or "").lower()
+        execucao_manual = bool(
+            dag_run
+            and (
+                getattr(dag_run, "external_trigger", False)
+                or "manual" in run_type
+            )
         )
 
+        if execucao_manual:
+            modo_busca = run_conf.get("modo_busca", dag_params.get("modo_busca", "filtro"))
+            propostas = run_conf.get("propostas", dag_params.get("propostas", ""))
+            if "filtros" in run_conf:
+                params_init = run_conf["filtros"]
+            elif "params" in run_conf:
+                params_init = run_conf["params"]
+            elif run_conf:
+                params_init = {
+                    key: value
+                    for key, value in run_conf.items()
+                    if key not in {"modo_busca", "propostas", "origem"}
+                }
+            else:
+                params_init = dag_params.get("filtros", {})
+        else:
+            modo_busca = "filtro"
+            propostas = ""
+            params_init = None
+
+        if execucao_manual and not isinstance(params_init, dict):
+            raise ValueError("Na execucao manual, 'filtros' ou 'params' deve ser um objeto JSON.")
+
         run_uuid = str(uuid.uuid4())
-        run_started_at = format_api_datetime(datetime.now(pytz.timezone("America/Sao_Paulo")))
-        logger.info("[NEWCORBAN] Inicio run_uuid=%s modo_busca=%s", run_uuid, modo_busca)
+        logger.info(
+            "[NEWCORBAN] Inicio run_uuid=%s modo_busca=%s execucao_manual=%s",
+            run_uuid,
+            modo_busca,
+            execucao_manual,
+        )
 
         df_api, api_meta = correcao_api(
             params_init=params_init,
             run_uuid=run_uuid,
             modo_busca=modo_busca,
             propostas=propostas,
+            usar_cursor_incremental=not execucao_manual,
         )
         total_gravado = insert_newcorban_postgres(df_api)
-        if api_meta.get("modo_busca") == "filtro" and api_meta.get("automatic_signature_date"):
-            save_incremental_signature_date(run_started_at)
-            logger.info("[ASSINADAS PARCEIROS] Cursor incremental atualizado para %s", run_started_at)
+        if not execucao_manual:
+            cursor_to_save = api_meta.get("signature_date_lt")
+            if not cursor_to_save:
+                raise RuntimeError("Execucao automatica sem SignatureDate.lt; cursor nao pode ser salvo.")
+            save_incremental_signature_date(cursor_to_save)
+            logger.info("[ASSINADAS PARCEIROS] Cursor incremental atualizado para %s", cursor_to_save)
+        else:
+            logger.info("[ASSINADAS PARCEIROS] Execucao manual concluida; cursor incremental preservado.")
 
         logger.info(
             "[NEWCORBAN] Finalizado run_uuid=%s | coletados=%s | paginas=%s | gravados=%s",
@@ -957,9 +1054,86 @@ with DAG(
             "paginas": api_meta.get("total_pages"),
             "gravados": total_gravado,
             "signature_date_gte": api_meta.get("signature_date_gte"),
+            "signature_date_lt": api_meta.get("signature_date_lt"),
         }
 
     fetch_and_upsert_task = PythonOperator(
         task_id='fetch_and_upsert_newcorban',
         python_callable=fetch_and_upsert_newcorban,
+    )
+
+
+reconciliation_default_args = {
+    'owner': 'airflow',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+reconciliation_start_date = pytz.timezone("America/Sao_Paulo").localize(
+    datetime(2026, 9, 25)
+)
+
+
+with DAG(
+    dag_id='etl_newcorban_insert_parceiros_reconciliacao_21h',
+    default_args=reconciliation_default_args,
+    start_date=reconciliation_start_date,
+    schedule_interval='0 21 * * *',
+    catchup=False,
+    max_active_runs=1,
+    description='Reprocessa as assinaturas do dia corrente sem alterar o cursor incremental',
+    tags=['newcorban', 'assinadas', 'parceiro', 'reconciliacao'],
+) as dag_reconciliacao_21h:
+    TriggerDagRunOperator(
+        task_id='reprocessar_dia_corrente',
+        trigger_dag_id='etl_newcorban_insert_parceiros',
+        trigger_run_id='reconciliacao_21h__{{ ts_nodash }}',
+        conf={
+            'modo_busca': 'filtro',
+            'filtros': {
+                'SignatureDate.gte': (
+                    "{{ data_interval_end.in_timezone('America/Sao_Paulo').strftime('%Y-%m-%d') }}"
+                    "T00:00:00"
+                ),
+                'SignatureDate.lt': (
+                    "{{ data_interval_end.in_timezone('America/Sao_Paulo')"
+                    ".strftime('%Y-%m-%dT%H:%M:%S') }}"
+                ),
+                'limit': 100,
+            },
+            'origem': 'reconciliacao_21h',
+        },
+        wait_for_completion=False,
+    )
+
+
+with DAG(
+    dag_id='etl_newcorban_insert_parceiros_reconciliacao_3_dias',
+    default_args=reconciliation_default_args,
+    start_date=reconciliation_start_date,
+    schedule_interval='0 2 * * *',
+    catchup=False,
+    max_active_runs=1,
+    description='Reprocessa as assinaturas dos tres dias anteriores completos sem alterar o cursor',
+    tags=['newcorban', 'assinadas', 'parceiro', 'reconciliacao'],
+) as dag_reconciliacao_3_dias:
+    TriggerDagRunOperator(
+        task_id='reprocessar_tres_dias_completos',
+        trigger_dag_id='etl_newcorban_insert_parceiros',
+        trigger_run_id='reconciliacao_3_dias__{{ ts_nodash }}',
+        conf={
+            'modo_busca': 'filtro',
+            'filtros': {
+                'SignatureDate.gte': (
+                    "{{ macros.ds_add(data_interval_end.in_timezone('America/Sao_Paulo')"
+                    ".strftime('%Y-%m-%d'), -3) }}T00:00:00"
+                ),
+                'SignatureDate.lt': (
+                    "{{ data_interval_end.in_timezone('America/Sao_Paulo')"
+                    ".strftime('%Y-%m-%d') }}T00:00:00"
+                ),
+                'limit': 100,
+            },
+            'origem': 'reconciliacao_3_dias',
+        },
+        wait_for_completion=False,
     )
