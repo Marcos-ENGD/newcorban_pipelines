@@ -37,6 +37,10 @@ FASE_AGUARDANDO_SALDO_ID = 9148
 FASE_REPROVA_POS_CIP = "Reprova Pós-CIP"
 FASE_REPROVA_POS_CIP_ID = 9112
 MOTIVO_REPROVA_POS_CIP = "Reprova Pos-CIP"
+MOTIVO_REPROVA_BLOQUEADO_NUCLEA_NOME_CLIENTE = (
+    "Termo de proposta de portabilidade recusado pela N\u00faclea - "
+    "Valor inv\u00e1lido para o campo: Nome do Cliente."
+)
 FASE_REPROVADA_CANCELADA = "Reprovada - Cancelada"
 FASE_REPROVADA_CANCELADA_ID = 9117
 FASE_INTEGRADO_ID = 9115
@@ -1009,7 +1013,7 @@ def build_conciliacao(
 
     contratos_port_reprova_pos_cip = set(
         df.loc[
-            mask_port_refin
+            mask_pernas_port_refin
             & (
                 (df["nw_fase_norm"] == normalize_key(FASE_REPROVA_POS_CIP))
                 | (df["crm_status_norm"] == normalize_key(FASE_REPROVA_POS_CIP))
@@ -1046,7 +1050,7 @@ def build_conciliacao(
             FASE_REPROVA_POS_CIP,
             FASE_REPROVA_POS_CIP_ID,
             "reprova_pos_cip_forcada",
-            "Port + Refin em Reprova Pós-CIP; Port + Refin e Refin da Port forcados para Reprova Pós-CIP e travados nessa fase.",
+            "Uma das pernas do contrato esta em Reprova Pos-CIP; Port + Refin e Refin da Port forcados para Reprova Pos-CIP e travados nessa fase.",
         )
 
     mask_reprova_pos_cip_travada = df["crm_status_norm"] == normalize_key(FASE_REPROVA_POS_CIP)
@@ -1529,31 +1533,20 @@ def build_conciliacao(
     ] = "Portabilidade em Aguardando Averbação no CRM só pode atualizar se a fase destino for Integrado."
 
     fases_reprovacao_bloqueio_norm = {normalize_key(fase) for fase in FASES_REPROVACAO_BLOQUEIO}
-    contratos_bloquear_reprovacao = set(
-        df.loc[
-            (df["resultado"] == "falta_atualizar")
-            & (df["tipo_nome"].isin(["Port + Refin", "Refin da Port"]))
-            & (df["numero_contrato_match"].notna())
-            & (
-                (df["nw_fase_norm"].isin(fases_reprovacao_bloqueio_norm))
-                | (df["depara_status_origem_norm"].isin(fases_reprovacao_bloqueio_norm))
-                | (df["crm_status_norm"] == normalize_key(FASE_REPROVA_POS_CIP))
-            ),
-            "numero_contrato_match",
-        ].dropna()
+    mask_saida_fase_reprovacao_bloqueada = (
+        (df["resultado"] == "falta_atualizar")
+        & (df["crm_status_norm"].isin(fases_reprovacao_bloqueio_norm))
+        & (df["nw_fase_norm"] != df["crm_status_norm"])
     )
-    if contratos_bloquear_reprovacao:
-        mask_bloqueio_reprovacao_pernas = (
-            (df["resultado"] == "falta_atualizar")
-            & (df["tipo_nome"].isin(["Port + Refin", "Refin da Port"]))
-            & (df["numero_contrato_match"].isin(contratos_bloquear_reprovacao))
-        )
-        df.loc[mask_bloqueio_reprovacao_pernas, "resultado"] = "alteracao_barrada"
-        df.loc[mask_bloqueio_reprovacao_pernas, "regra_conciliacao"] = "alteracao_barrada"
-        df.loc[
-            mask_bloqueio_reprovacao_pernas,
-            "observacao_regra",
-        ] = "Contrato com Port + Refin/Refin da Port em fluxo de reprovacao/cancelamento; bloqueadas as duas pernas."
+    df.loc[mask_saida_fase_reprovacao_bloqueada, "resultado"] = "alteracao_barrada"
+    df.loc[
+        mask_saida_fase_reprovacao_bloqueada,
+        "regra_conciliacao",
+    ] = "saida_fase_reprovacao_bloqueada"
+    df.loc[
+        mask_saida_fase_reprovacao_bloqueada,
+        "observacao_regra",
+    ] = "Proposta ja esta em fase protegida de reprovacao/cancelamento no CRM e nao pode sair para outra fase."
 
     mask_substatus_portabilidade_finalizada = (
         (df["resultado"] == "falta_atualizar")
@@ -1581,6 +1574,64 @@ def build_conciliacao(
         mask_margem_negativa_bloqueada,
         "observacao_regra",
     ] = "Proposta em Margem Negativa – Saldo Pago no CRM; conciliacao bloqueada para nao alterar a fase."
+
+    mask_averbacao_para_saldo_barrada = (
+        (df["resultado"] == "falta_atualizar")
+        & (
+            df["crm_status_norm"].isin([
+                normalize_key(FASE_AGUARDANDO_AVERBACAO),
+                normalize_key(FASE_AGUARDA_AVERBACAO),
+            ])
+        )
+        & (df["nw_fase_norm"] == normalize_key(FASE_AGUARDANDO_SALDO))
+    )
+    df.loc[mask_averbacao_para_saldo_barrada, "resultado"] = "alteracao_barrada"
+    df.loc[
+        mask_averbacao_para_saldo_barrada,
+        "regra_conciliacao",
+    ] = "averbacao_para_saldo_barrada"
+    df.loc[
+        mask_averbacao_para_saldo_barrada,
+        "observacao_regra",
+    ] = "Proposta em Aguardando Averbacao no CRM nao pode retornar para Aguardando Saldo."
+
+    motivo_nuclea_nome_cliente_norm = normalize_text(
+        MOTIVO_REPROVA_BLOQUEADO_NUCLEA_NOME_CLIENTE
+    ).rstrip(".")
+    mask_motivo_nuclea_nome_cliente = (
+        (df["nota_status_norm"].str.rstrip(".") == motivo_nuclea_nome_cliente_norm)
+        | (
+            get_series(df, "depara_motivo_original")
+            .apply(normalize_text)
+            .str.rstrip(".")
+            == motivo_nuclea_nome_cliente_norm
+        )
+        | (
+            get_series(df, "depara_motivo")
+            .apply(normalize_text)
+            .str.rstrip(".")
+            == motivo_nuclea_nome_cliente_norm
+        )
+    )
+    mask_reprova_motivo_nuclea_barrada = (
+        (df["resultado"] == "falta_atualizar")
+        & (
+            df["nw_fase_norm"].isin([
+                normalize_key(FASE_REPROVA_POS_CIP),
+                normalize_key(FASE_REPROVADA_CANCELADA),
+            ])
+        )
+        & mask_motivo_nuclea_nome_cliente
+    )
+    df.loc[mask_reprova_motivo_nuclea_barrada, "resultado"] = "alteracao_barrada"
+    df.loc[
+        mask_reprova_motivo_nuclea_barrada,
+        "regra_conciliacao",
+    ] = "reprova_motivo_nuclea_nome_cliente_barrada"
+    df.loc[
+        mask_reprova_motivo_nuclea_barrada,
+        "observacao_regra",
+    ] = "Reprovacao bloqueada para o motivo da Nuclea com valor invalido no campo Nome do Cliente."
 
     started_payloads = time.perf_counter()
     mask_falta_atualizar = df["resultado"] == "falta_atualizar"
